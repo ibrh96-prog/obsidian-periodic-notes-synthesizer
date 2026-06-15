@@ -1,7 +1,7 @@
 {
   "id": "periodic-notes-synthesizer",
   "name": "Periodic Notes Synthesizer",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "minAppVersion": "1.5.0",
   "description": "Upper-level synthesis of your accumulated daily and periodic notes: monthly and quarterly rollups, recurring themes, open loops, and what you said versus what you did.",
   "author": "ibrh96-prog",
