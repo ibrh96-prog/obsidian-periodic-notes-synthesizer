@@ -1,11 +1,62 @@
 import type { LLMAdapter } from "./llm";
+import { djb2 } from "./types";
+import type { Commitment, NoteExtraction, PeriodicNote } from "./types";
+
+// --- Shape the LLM is asked to return (validated before use) ---
+
+interface RawNoteExtraction {
+	summary: string;
+	topics: string[];
+	commitments: string[];
+	openLoops: string[];
+	language?: string;
+}
+
+/**
+ * Why a parse attempt yielded nothing usable. "invalid-json" and "empty"
+ * (syntactically valid JSON but no real value in it) have different causes in
+ * the field — weak JSON mode vs. a note the model couldn't read — so they are
+ * reported separately.
+ */
+type ParseOutcome<T> =
+	| { kind: "ok"; value: T }
+	| { kind: "invalid-json" }
+	| { kind: "empty" };
+
+const EXTRACTION_SYSTEM_PROMPT = [
+	"You extract structured data from a single daily/periodic note.",
+	"",
+	"Return ONLY a valid JSON object — no markdown code fences, no commentary,",
+	"no prose before or after. The object must match exactly this shape:",
+	"{",
+	'  "summary": string,',
+	'  "topics": string[],',
+	'  "commitments": string[],',
+	'  "openLoops": string[],',
+	'  "language": string',
+	"}",
+	"",
+	"Rules:",
+	'- "summary" is 2-3 sentences giving a high-level overview of what the',
+	"  note is about, written in the note's OWN language.",
+	'- "topics" are broad canonical category labels, lowercase, no duplicates.',
+	"  Use BROAD, reusable categories that other notes would also share,",
+	"  NOT specific names, products, or events.",
+	'- "commitments" are intentions, plans, or tasks the author stated they',
+	"  WILL do, in the author's own words, each one short. If the note states",
+	"  none, use an empty array.",
+	'- "openLoops" are unresolved questions or pending items raised that day.',
+	"  If the note has none, use an empty array.",
+	'- "language" is the ISO 639-1 code of the note\'s language,',
+	'  e.g. "en", "tr", "de".',
+	'- If a field is unknown, use an empty array or "" as appropriate.',
+	"- Do NOT invent content that is not in the note.",
+].join("\n");
 
 /**
  * Pure synthesis engine. No Obsidian API, no clock, no vault I/O — the only
- * outside contact is the network, and that only through the injected
- * {@link LLMAdapter}. Phase 2 is a skeleton: the constructor and adapter field
- * exist so the class compiles and is importable. The real logic lands in
- * Phase 3.
+ * outside contact is the network, through the injected {@link LLMAdapter}.
+ * Phase 3 Feature 1: per-note extraction.
  */
 export class SynthesisEngine {
 	private readonly adapter: LLMAdapter;
@@ -14,6 +65,202 @@ export class SynthesisEngine {
 		this.adapter = adapter;
 	}
 
-	// Phase 3: per-note extraction
-	// Phase 3: per-theme synthesis
+	/**
+	 * Ask the LLM to extract one note. Parses the response defensively and
+	 * retries once on invalid JSON. Returns null (and warns) if both attempts
+	 * fail, if the request itself throws (network/auth), or if the result is
+	 * valid-but-empty (no summary and no topics — boilerplate/nav noise) — so
+	 * the caller can warn-and-skip without aborting the whole sync.
+	 */
+	async extractNote(
+		note: PeriodicNote,
+		body: string
+	): Promise<NoteExtraction | null> {
+		const userPrompt = this.buildUserPrompt(note, body);
+
+		try {
+			const first = await this.adapter.complete(
+				EXTRACTION_SYSTEM_PROMPT,
+				userPrompt
+			);
+			const firstOutcome = this.parseExtraction(first);
+			if (firstOutcome.kind === "ok") {
+				return this.toNoteExtraction(note, firstOutcome.value);
+			}
+
+			const complaint =
+				firstOutcome.kind === "empty"
+					? "Your previous output was valid JSON but contained no summary. " +
+						"Return the JSON object with a non-empty summary."
+					: "Your previous output was not valid JSON. Return ONLY the JSON object.";
+			const retryPrompt = `${userPrompt}\n\n${complaint}`;
+			const second = await this.adapter.complete(
+				EXTRACTION_SYSTEM_PROMPT,
+				retryPrompt
+			);
+			const secondOutcome = this.parseExtraction(second);
+			if (secondOutcome.kind === "ok") {
+				return this.toNoteExtraction(note, secondOutcome.value);
+			}
+
+			// Response body text only — never API keys or headers.
+			const reason =
+				secondOutcome.kind === "empty"
+					? "valid JSON but empty extraction"
+					: "invalid JSON";
+			console.warn(
+				`[Periodic Notes Synthesizer] Extraction failed (${reason}) for note: ${note.path}. ` +
+					`Raw response (first 300 chars): ${second.slice(0, 300)}`
+			);
+			return null;
+		} catch (error) {
+			console.warn(
+				`[Periodic Notes Synthesizer] Extraction request failed for note: ${note.path}`,
+				error
+			);
+			return null;
+		}
+	}
+
+	private buildUserPrompt(note: PeriodicNote, body: string): string {
+		const lines = [`Title: ${note.title}`];
+		if (note.date) {
+			lines.push(`Date: ${note.date}`);
+		}
+		lines.push("", "Note content:", body);
+		return lines.join("\n");
+	}
+
+	/** Assemble the cached extraction from a validated LLM result. */
+	private toNoteExtraction(
+		note: PeriodicNote,
+		raw: RawNoteExtraction
+	): NoteExtraction {
+		const commitments: Commitment[] = raw.commitments.map((text) => ({
+			text,
+			status: "open",
+		}));
+
+		const extraction: NoteExtraction = {
+			id: djb2(note.path),
+			summary: raw.summary,
+			topics: raw.topics,
+			commitments,
+			openLoops: raw.openLoops,
+		};
+		if (raw.language !== undefined) {
+			extraction.language = raw.language;
+		}
+		return extraction;
+	}
+
+	private parseExtraction(raw: string): ParseOutcome<RawNoteExtraction> {
+		const value = this.extractJsonValue(raw);
+		if (value === undefined) {
+			return { kind: "invalid-json" };
+		}
+		const extraction = this.coerceExtraction(value);
+		if (extraction === null) {
+			return { kind: "empty" };
+		}
+		return { kind: "ok", value: extraction };
+	}
+
+	/**
+	 * Best-effort JSON recovery from a raw model response. Strips code fences,
+	 * parses as-is, and if that fails retries on the substring from the first
+	 * "{" to the last "}" (weak models often wrap JSON in prose). Returns
+	 * undefined when nothing parses — a safe sentinel, since JSON.parse never
+	 * yields it.
+	 */
+	private extractJsonValue(raw: string): unknown {
+		const cleaned = this.stripFences(raw);
+
+		const direct = this.tryParseJson(cleaned);
+		if (direct !== undefined) {
+			return direct;
+		}
+
+		const start = cleaned.indexOf("{");
+		const end = cleaned.lastIndexOf("}");
+		if (start !== -1 && end > start) {
+			return this.tryParseJson(cleaned.slice(start, end + 1));
+		}
+		return undefined;
+	}
+
+	/** JSON.parse that returns undefined instead of throwing. */
+	private tryParseJson(text: string): unknown {
+		try {
+			return JSON.parse(text);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Remove an accidental ```json … ``` wrapper before parsing. */
+	private stripFences(raw: string): string {
+		let text = raw.trim();
+		if (text.startsWith("```")) {
+			text = text
+				.replace(/^```[a-zA-Z]*\s*/, "")
+				.replace(/\s*```$/, "");
+		}
+		return text.trim();
+	}
+
+	/**
+	 * Validate/normalize an arbitrary parsed value into a RawNoteExtraction.
+	 * Valid-but-empty (no summary AND no topics) returns null so the caller
+	 * warn-and-skips boilerplate/nav notes.
+	 */
+	private coerceExtraction(value: unknown): RawNoteExtraction | null {
+		if (typeof value !== "object" || value === null) {
+			return null;
+		}
+		const obj = value as Record<string, unknown>;
+
+		const summary =
+			typeof obj["summary"] === "string" ? obj["summary"].trim() : "";
+		const topics = this.dedupe(
+			this.toStringArray(obj["topics"]).map((t) => t.toLowerCase())
+		);
+
+		if (summary === "" && topics.length === 0) {
+			return null;
+		}
+
+		const extraction: RawNoteExtraction = {
+			summary,
+			topics,
+			commitments: this.toStringArray(obj["commitments"]),
+			openLoops: this.toStringArray(obj["openLoops"]),
+		};
+
+		// Accept "en" but also sloppy variants like "en-US"; keep the 639-1 part.
+		const language =
+			typeof obj["language"] === "string"
+				? obj["language"].trim().toLowerCase()
+				: "";
+		const languageMatch = language.match(/^[a-z]{2}/);
+		if (languageMatch) {
+			extraction.language = languageMatch[0];
+		}
+
+		return extraction;
+	}
+
+	private toStringArray(value: unknown): string[] {
+		if (!Array.isArray(value)) {
+			return [];
+		}
+		return value
+			.filter((v): v is string => typeof v === "string")
+			.map((v) => v.trim())
+			.filter((v) => v !== "");
+	}
+
+	private dedupe(values: string[]): string[] {
+		return [...new Set(values)];
+	}
 }
