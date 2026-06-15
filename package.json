@@ -1,0 +1,19 @@
+{
+  "name": "obsidian-periodic-notes-synthesizer",
+  "version": "0.1.0",
+  "description": "Upper-level synthesis of accumulated daily and periodic notes.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": [],
+  "author": "ibrh96-prog",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "latest",
+    "typescript": "^5.0.0"
+  }
+}
