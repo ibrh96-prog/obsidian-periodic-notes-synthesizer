@@ -67,6 +67,28 @@ const MATCH_SYSTEM_PROMPT = [
 	"none were completed.",
 ].join("\n");
 
+const THEME_SYSTEM_PROMPT = [
+	"You analyze how a set of daily/periodic notes relate around a shared theme.",
+	"",
+	"Identify the CONSENSUS — the throughline, what consistently holds across",
+	"the notes — and the TENSION — any contradiction, unresolved conflict, or",
+	"shift over time.",
+	"",
+	"Respond with ONLY a JSON object — no markdown code fences, no commentary,",
+	"no prose before or after — of exactly this shape:",
+	"{",
+	'  "consensus": string,',
+	'  "tension": string,',
+	'  "language": string',
+	"}",
+	"",
+	"Rules:",
+	'- Write "consensus" and "tension" in the dominant language of the notes.',
+	'- If there is no real tension, set "tension" to "" — do NOT invent one.',
+	'- "language" is the ISO 639-1 code of that dominant language,',
+	'  e.g. "en", "tr", "de".',
+].join("\n");
+
 /**
  * Pure synthesis engine. No Obsidian API, no clock, no vault I/O — the only
  * outside contact is the network, through the injected {@link LLMAdapter}.
@@ -163,6 +185,92 @@ export class SynthesisEngine {
 		}
 		const obj = value as Record<string, unknown>;
 		return this.toStringArray(obj["done"]);
+	}
+
+	/**
+	 * Synthesize one theme from its member notes' summaries. One LLM call.
+	 * Returns the consensus/tension (and optional language); the caller stamps
+	 * the signature and stores it. Safe-parse with one retry, then throws on a
+	 * second failure so the caller can warn-and-skip this theme. Pure: never
+	 * touches the cache.
+	 */
+	async synthesizeTheme(input: {
+		topic: string;
+		members: { summary: string; date: string | null }[];
+	}): Promise<{ consensus: string; tension: string; language?: string }> {
+		const userPrompt = this.buildThemePrompt(input);
+
+		const first = await this.adapter.complete(THEME_SYSTEM_PROMPT, userPrompt);
+		let synthesis = this.parseTheme(first);
+		if (synthesis === null) {
+			const retryPrompt =
+				`${userPrompt}\n\n` +
+				"Your previous output was not valid JSON. Return ONLY the JSON object.";
+			const second = await this.adapter.complete(
+				THEME_SYSTEM_PROMPT,
+				retryPrompt
+			);
+			synthesis = this.parseTheme(second);
+			if (synthesis === null) {
+				throw new Error("Theme synthesis returned unparseable JSON twice.");
+			}
+		}
+
+		return synthesis;
+	}
+
+	private buildThemePrompt(input: {
+		topic: string;
+		members: { summary: string; date: string | null }[];
+	}): string {
+		const lines = [`Theme: ${input.topic}`, "", "Notes:"];
+		for (const member of input.members) {
+			lines.push("");
+			lines.push(`Date: ${member.date ?? "no date"}`);
+			lines.push(`Summary: ${this.oneLine(member.summary)}`);
+		}
+		return lines.join("\n");
+	}
+
+	/**
+	 * Safe-parse a theme synthesis response. Returns null on invalid JSON (caller
+	 * retries once, then throws). Coerces a missing consensus/tension to "".
+	 */
+	private parseTheme(
+		raw: string
+	): { consensus: string; tension: string; language?: string } | null {
+		const value = this.extractJsonValue(raw);
+		if (value === undefined) {
+			return null;
+		}
+		if (typeof value !== "object" || value === null) {
+			return null;
+		}
+		const obj = value as Record<string, unknown>;
+
+		const synthesis: { consensus: string; tension: string; language?: string } =
+			{
+				consensus:
+					typeof obj["consensus"] === "string" ? obj["consensus"].trim() : "",
+				tension:
+					typeof obj["tension"] === "string" ? obj["tension"].trim() : "",
+			};
+
+		const language =
+			typeof obj["language"] === "string"
+				? obj["language"].trim().toLowerCase()
+				: "";
+		const languageMatch = language.match(/^[a-z]{2}/);
+		if (languageMatch) {
+			synthesis.language = languageMatch[0];
+		}
+
+		return synthesis;
+	}
+
+	/** Flatten multiline text to a single line for prompt list items. */
+	private oneLine(text: string): string {
+		return text.replace(/\s*\n\s*/g, " ").trim();
 	}
 
 	/**

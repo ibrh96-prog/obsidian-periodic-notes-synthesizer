@@ -13,6 +13,7 @@ import {
 	type NoteExtraction,
 	type PeriodicNote,
 	type SynthesisCache,
+	type ThemeSynthesis,
 } from "./types";
 
 /** One cached extraction joined with its note's current title and date, for
@@ -165,6 +166,10 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 			}
 		}
 
+		// --- Theme synthesis: synthesize each shared-topic theme (incremental).
+		// Runs after extraction, before said-vs-did matching.
+		const synthesizedThemes = await this.synthesizeThemes(notes);
+
 		// --- Said vs did: recompute commitment completion across the FULL cached
 		// set every sync. A commitment from an earlier note can be completed by a
 		// note synced in a later run, so this runs whenever any extraction exists
@@ -174,14 +179,112 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 
 		await this.saveSettings();
 
+		const themesClause =
+			synthesizedThemes > 0
+				? ` ${synthesizedThemes} theme${synthesizedThemes === 1 ? "" : "s"} synthesized.`
+				: "";
 		const doneClause =
 			markedDone > 0
 				? ` ${markedDone} commitment${markedDone === 1 ? "" : "s"} marked done.`
 				: "";
 		new Notice(
 			`Synced ${synced} note${synced === 1 ? "" : "s"} ` +
-				`(${resynthesized} re-synthesized, ${skipped} skipped).${doneClause}`
+				`(${resynthesized} re-synthesized, ${skipped} skipped).${themesClause}${doneClause}`
 		);
+	}
+
+	/**
+	 * Synthesize each theme (a lowercase topic shared by 2+ cached notes) via one
+	 * LLM call, incrementally. A theme is re-synthesized only when its member set
+	 * or any member's mtime changed (signature mismatch) — unchanged themes cost
+	 * zero tokens. A failed theme is warned and skipped, leaving any prior entry
+	 * untouched. Syntheses for topics that are no longer themes are pruned.
+	 * Returns the count actually synthesized this run (for the Notice).
+	 */
+	private async synthesizeThemes(notes: PeriodicNote[]): Promise<number> {
+		const cachedPaths = Object.keys(this.cache.extractions);
+
+		const dateByPath = new Map<string, string | null>();
+		for (const note of notes) {
+			dateByPath.set(note.path, note.date);
+		}
+
+		// Group cached note paths by lowercase topic.
+		const groups = new Map<string, string[]>();
+		for (const path of cachedPaths) {
+			const extraction = this.cache.extractions[path].extraction;
+			for (const topic of new Set(extraction.topics)) {
+				const members = groups.get(topic) ?? [];
+				members.push(path);
+				groups.set(topic, members);
+			}
+		}
+
+		// Themes = topics carried by 2+ distinct notes.
+		const themeKeys = new Set<string>();
+		for (const [topic, paths] of groups) {
+			if (paths.length >= 2) {
+				themeKeys.add(topic);
+			}
+		}
+
+		let synthesized = 0;
+		for (const topic of themeKeys) {
+			const memberPaths = groups.get(topic) ?? [];
+			const signature = this.themeSignature(memberPaths);
+
+			const existing = this.cache.themeSyntheses[topic];
+			if (existing && existing.signature === signature) {
+				// Members and their mtimes unchanged — reuse, no API call.
+				continue;
+			}
+
+			const members = memberPaths.map((path) => ({
+				summary: this.cache.extractions[path].extraction.summary,
+				date: dateByPath.get(path) ?? null,
+			}));
+
+			try {
+				const result = await this.engine.synthesizeTheme({ topic, members });
+				const entry: ThemeSynthesis = {
+					consensus: result.consensus,
+					tension: result.tension,
+					signature,
+				};
+				if (result.language !== undefined) {
+					entry.language = result.language;
+				}
+				this.cache.themeSyntheses[topic] = entry;
+				synthesized += 1;
+			} catch (error) {
+				// One bad theme never aborts the sync; leave any prior entry as-is.
+				console.warn(
+					`[Periodic Notes Synthesizer] Theme synthesis failed for theme: ${topic}`,
+					error
+				);
+			}
+		}
+
+		// Prune syntheses for topics that are no longer 2+-member themes.
+		for (const key of Object.keys(this.cache.themeSyntheses)) {
+			if (!themeKeys.has(key)) {
+				delete this.cache.themeSyntheses[key];
+			}
+		}
+
+		return synthesized;
+	}
+
+	/**
+	 * Change-detection signature for a theme: a djb2 hash of its member
+	 * "path:mtime" pairs, sorted so order never affects it. Identical signature
+	 * ⇒ same members, none edited ⇒ no need to re-synthesize.
+	 */
+	private themeSignature(memberPaths: string[]): string {
+		const parts = memberPaths
+			.map((path) => `${path}:${this.cache.extractions[path].mtime}`)
+			.sort();
+		return djb2(parts.join("|"));
 	}
 
 	/**
@@ -412,12 +515,16 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 				lines.push(`### ${theme.topic}`);
 				const memberTitles = theme.members.map((m) => m.title).join(", ");
 				lines.push(`Notes: ${memberTitles}`);
+				lines.push("");
 				const synthesis = this.cache.themeSyntheses[theme.topic];
 				if (synthesis) {
 					lines.push(synthesis.consensus);
-					lines.push(`Tension: ${synthesis.tension}`);
+					lines.push("");
+					if (synthesis.tension) {
+						lines.push(`Tension: ${synthesis.tension}`);
+						lines.push("");
+					}
 				}
-				lines.push("");
 			}
 		}
 

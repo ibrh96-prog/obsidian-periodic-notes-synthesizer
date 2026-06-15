@@ -23,6 +23,7 @@ export interface ThemeSynthesis {
 	consensus: string;
 	tension: string;
 	language?: string;
+	signature: string;   // djb2 of sorted "path:mtime" of member notes; used for incremental skip
 }
 
 export interface SynthesisCache {
