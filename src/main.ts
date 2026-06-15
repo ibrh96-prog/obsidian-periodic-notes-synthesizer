@@ -8,6 +8,7 @@ import { LLMAdapter, MAX_INPUT_CHARS } from "./llm";
 import { PeriodicNoteCollector } from "./collector";
 import { SynthesisEngine } from "./synthesizer";
 import {
+	djb2,
 	emptyCache,
 	type NoteExtraction,
 	type PeriodicNote,
@@ -164,12 +165,95 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 			}
 		}
 
+		// --- Said vs did: recompute commitment completion across the FULL cached
+		// set every sync. A commitment from an earlier note can be completed by a
+		// note synced in a later run, so this runs whenever any extraction exists
+		// — even an incremental sync that synced 0 new notes. Idempotent: reset
+		// every commitment to "open", then mark the ones the model judged done.
+		const markedDone = await this.matchCommitments(notes);
+
 		await this.saveSettings();
 
+		const doneClause =
+			markedDone > 0
+				? ` ${markedDone} commitment${markedDone === 1 ? "" : "s"} marked done.`
+				: "";
 		new Notice(
 			`Synced ${synced} note${synced === 1 ? "" : "s"} ` +
-				`(${resynthesized} re-synthesized, ${skipped} skipped).`
+				`(${resynthesized} re-synthesized, ${skipped} skipped).${doneClause}`
 		);
+	}
+
+	/**
+	 * Recompute said-vs-did across the whole cache via one LLM call. Resets every
+	 * cached commitment to "open" first (idempotent recompute), then marks those
+	 * the model judged completed as "done". Commitment ids are derived on the fly
+	 * from path + text — never persisted, only used to map the model's answer
+	 * back. Never crashes the sync: any failure warns and leaves all commitments
+	 * open. Returns the count marked done (0 on failure or when none completed).
+	 */
+	private async matchCommitments(notes: PeriodicNote[]): Promise<number> {
+		const cachedPaths = Object.keys(this.cache.extractions);
+		if (cachedPaths.length === 0) {
+			return 0;
+		}
+
+		// path -> current date (undated or vanished notes resolve to null).
+		const dateByPath = new Map<string, string | null>();
+		for (const note of notes) {
+			dateByPath.set(note.path, note.date);
+		}
+
+		// RESET: every commitment back to open before re-deciding.
+		for (const path of cachedPaths) {
+			for (const commitment of this.cache.extractions[path].extraction
+				.commitments) {
+				commitment.status = "open";
+			}
+		}
+
+		const commitments: { id: string; text: string; date: string | null }[] =
+			[];
+		const laterSummaries: { date: string | null; summary: string }[] = [];
+		for (const path of cachedPaths) {
+			const entry = this.cache.extractions[path];
+			const date = dateByPath.get(path) ?? null;
+			laterSummaries.push({ date, summary: entry.extraction.summary });
+			for (const commitment of entry.extraction.commitments) {
+				commitments.push({
+					id: djb2(`${path}|${commitment.text}`),
+					text: commitment.text,
+					date,
+				});
+			}
+		}
+
+		try {
+			const doneIds = await this.engine.matchCommitments({
+				commitments,
+				laterSummaries,
+			});
+			const doneSet = new Set(doneIds);
+
+			let markedDone = 0;
+			for (const path of cachedPaths) {
+				for (const commitment of this.cache.extractions[path].extraction
+					.commitments) {
+					if (doneSet.has(djb2(`${path}|${commitment.text}`))) {
+						commitment.status = "done";
+						markedDone += 1;
+					}
+				}
+			}
+			return markedDone;
+		} catch (error) {
+			// Never surface to the user: leave every commitment open and move on.
+			console.warn(
+				"[Periodic Notes Synthesizer] Commitment matching failed; leaving all commitments open.",
+				error
+			);
+			return 0;
+		}
 	}
 
 	/**

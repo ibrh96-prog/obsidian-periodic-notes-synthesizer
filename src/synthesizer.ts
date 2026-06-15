@@ -53,6 +53,20 @@ const EXTRACTION_SYSTEM_PROMPT = [
 	"- Do NOT invent content that is not in the note.",
 ].join("\n");
 
+const MATCH_SYSTEM_PROMPT = [
+	"You decide which stated commitments were later completed, based ONLY on",
+	"summaries of notes written AFTER each commitment.",
+	"",
+	"A commitment counts as done only if a later summary clearly indicates it",
+	"was completed, resolved, or finished. When unsure, leave it open.",
+	"",
+	"Respond with ONLY a JSON object — no markdown code fences, no commentary,",
+	"no prose before or after — of exactly this shape:",
+	'{ "done": ["id1", "id2", ...] }',
+	"containing the ids of the completed commitments. Use an empty array when",
+	"none were completed.",
+].join("\n");
+
 /**
  * Pure synthesis engine. No Obsidian API, no clock, no vault I/O — the only
  * outside contact is the network, through the injected {@link LLMAdapter}.
@@ -63,6 +77,92 @@ export class SynthesisEngine {
 
 	constructor(adapter: LLMAdapter) {
 		this.adapter = adapter;
+	}
+
+	/**
+	 * Decide which stated commitments were later completed, using only summaries
+	 * of notes written after each commitment. One LLM call per sync. Returns the
+	 * ids judged "done" (filtered to ids actually present in the input). Empty
+	 * input short-circuits with no LLM call. Pure: the caller maps ids back to
+	 * commitments and writes statuses; the engine never touches the cache.
+	 *
+	 * Throws on a second parse failure so the caller can warn-and-skip (leaving
+	 * every commitment open). Never crashes the sync — the caller wraps this.
+	 */
+	async matchCommitments(input: {
+		commitments: { id: string; text: string; date: string | null }[];
+		laterSummaries: { date: string | null; summary: string }[];
+	}): Promise<string[]> {
+		if (input.commitments.length === 0) {
+			return [];
+		}
+
+		const userPrompt = this.buildMatchPrompt(input);
+
+		const first = await this.adapter.complete(MATCH_SYSTEM_PROMPT, userPrompt);
+		let done = this.parseMatch(first);
+		if (done === null) {
+			const retryPrompt =
+				`${userPrompt}\n\n` +
+				"Your previous output was not valid JSON. Return ONLY the JSON " +
+				'object {"done": [...]}.';
+			const second = await this.adapter.complete(
+				MATCH_SYSTEM_PROMPT,
+				retryPrompt
+			);
+			done = this.parseMatch(second);
+			if (done === null) {
+				throw new Error("Commitment matching returned unparseable JSON twice.");
+			}
+		}
+
+		// Drop any id the model invented that isn't a real commitment.
+		const validIds = new Set(input.commitments.map((c) => c.id));
+		return done.filter((id) => validIds.has(id));
+	}
+
+	private buildMatchPrompt(input: {
+		commitments: { id: string; text: string; date: string | null }[];
+		laterSummaries: { date: string | null; summary: string }[];
+	}): string {
+		const commitments = input.commitments.map((c) => ({
+			id: c.id,
+			text: c.text,
+			date: c.date,
+		}));
+		const laterSummaries = input.laterSummaries.map((s) => ({
+			date: s.date,
+			summary: s.summary,
+		}));
+		return [
+			"Commitments (each with its id, text, and the date it was made):",
+			JSON.stringify(commitments, null, 2),
+			"",
+			"Note summaries (each with its date):",
+			JSON.stringify(laterSummaries, null, 2),
+			"",
+			"For each commitment, look ONLY at summaries dated AFTER the",
+			"commitment's own date. A commitment is done only if such a later",
+			"summary clearly indicates it was completed, resolved, or finished.",
+			'Return ONLY {"done": [ids]} listing the ids of completed commitments.',
+		].join("\n");
+	}
+
+	/**
+	 * Safe-parse the matching response into an id list. Returns null on invalid
+	 * JSON (caller retries once, then throws). A valid object whose "done" is
+	 * missing or malformed yields [] — that's a legitimate "nothing completed".
+	 */
+	private parseMatch(raw: string): string[] | null {
+		const value = this.extractJsonValue(raw);
+		if (value === undefined) {
+			return null;
+		}
+		if (typeof value !== "object" || value === null) {
+			return null;
+		}
+		const obj = value as Record<string, unknown>;
+		return this.toStringArray(obj["done"]);
 	}
 
 	/**
