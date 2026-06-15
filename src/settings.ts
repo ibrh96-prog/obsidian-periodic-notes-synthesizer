@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type PeriodicNotesSynthesizerPlugin from "./main";
+import { verifyLicense } from "./license";
 
 export type LLMProvider = "anthropic" | "openai-compatible";
 
@@ -16,6 +17,9 @@ export interface PeriodicNotesSettings {
 	periodicTag: string;
 	staleDays: number;
 	proLicenseKey: string;
+	// Lifetime free-tier usage. A "use" is one successful sync; there is no
+	// monthly reset, so the count only ever grows until a Pro license unlocks it.
+	freeUsage: { count: number };
 }
 
 export const DEFAULT_SETTINGS: PeriodicNotesSettings = {
@@ -27,6 +31,7 @@ export const DEFAULT_SETTINGS: PeriodicNotesSettings = {
 	periodicTag: "daily",
 	staleDays: 90,
 	proLicenseKey: "",
+	freeUsage: { count: 0 },
 };
 
 export class PeriodicNotesSettingTab extends PluginSettingTab {
@@ -159,6 +164,17 @@ export class PeriodicNotesSettingTab extends PluginSettingTab {
 					});
 			});
 
-		new Setting(containerEl).setDesc("Free tier: 3 syncs total.");
+		const status = verifyLicense(this.plugin.settings.proLicenseKey);
+		if (status.valid) {
+			new Setting(containerEl)
+				.setName("Pro active")
+				.setDesc(
+					status.email ? `Licensed to ${status.email}` : "Pro license active."
+				);
+		} else {
+			new Setting(containerEl).setDesc(
+				`Free tier: ${this.plugin.settings.freeUsage.count} of 3 syncs used.`
+			);
+		}
 	}
 }

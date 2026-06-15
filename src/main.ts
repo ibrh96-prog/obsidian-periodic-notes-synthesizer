@@ -7,6 +7,7 @@ import {
 import { LLMAdapter, MAX_INPUT_CHARS } from "./llm";
 import { PeriodicNoteCollector } from "./collector";
 import { SynthesisEngine } from "./synthesizer";
+import { verifyLicense } from "./license";
 import {
 	djb2,
 	emptyCache,
@@ -115,6 +116,16 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 			return;
 		}
 
+		// Pro gate. Lifetime free tier: 3 successful syncs total, no monthly reset.
+		// Pro users are never counted or blocked. Bail before any LLM call.
+		const isPro = verifyLicense(this.settings.proLicenseKey).valid;
+		if (!isPro && this.settings.freeUsage.count >= 3) {
+			new Notice(
+				"Free limit reached (3 syncs). Enter a Pro license in settings to continue."
+			);
+			return;
+		}
+
 		const notes = await this.collector.collect();
 
 		// Paths already cached before this run distinguish re-synthesized from new.
@@ -176,6 +187,12 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 		// — even an incremental sync that synced 0 new notes. Idempotent: reset
 		// every commitment to "open", then mark the ones the model judged done.
 		const markedDone = await this.matchCommitments(notes);
+
+		// Count the use only after a fully successful sync run (one use per run,
+		// regardless of how many notes it touched). Pro users are never counted.
+		if (!isPro) {
+			this.settings.freeUsage.count += 1;
+		}
 
 		await this.saveSettings();
 
