@@ -50,7 +50,7 @@ This is operational synthesis of your daily-note practice — it works alongside
 | All AI providers | ✅ | ✅ |
 | Cross-note themes | ✅ | ✅ |
 
-The free tier allows 3 total syncs (a one-time allowance, not a monthly reset). Generating the periodic report from already-synced notes is always free. Pro is a one-time license that unlocks unlimited syncing — see the plugin's listing for purchase details.
+The free tier allows 3 total syncs (a one-time allowance, not a monthly reset). Generating the periodic report from already-synced notes is always free. Upgrade to Pro at [ibrh96.gumroad.com/l/orevhj](https://ibrh96.gumroad.com/l/orevhj) for unlimited syncing.
 
 ## Privacy
 
