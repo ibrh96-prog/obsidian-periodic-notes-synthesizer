@@ -8,6 +8,8 @@ import nacl from "tweetnacl";
 
 const EMBEDDED_PUBLIC_KEY = "KvULUdcXqG+AywX1laqhN9Ij+VcXx7ermKaNCi3umek=";
 
+export const GUMROAD_URL = "https://ibrh96.gumroad.com/l/orevhj";
+
 export interface LicenseStatus {
 	valid: boolean;
 	email?: string;

@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile } from "obsidian";
+import { Modal, Notice, Plugin, TFile } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	PeriodicNotesSettingTab,
@@ -7,7 +7,7 @@ import {
 import { LLMAdapter, MAX_INPUT_CHARS } from "./llm";
 import { PeriodicNoteCollector } from "./collector";
 import { SynthesisEngine } from "./synthesizer";
-import { verifyLicense } from "./license";
+import { verifyLicense, GUMROAD_URL } from "./license";
 import {
 	djb2,
 	emptyCache,
@@ -42,6 +42,7 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 	private adapter!: LLMAdapter;
 	private collector!: PeriodicNoteCollector;
 	private engine!: SynthesisEngine;
+	private isSyncInProgress = false;
 
 	override async onload(): Promise<void> {
 		await this.loadSettings();
@@ -116,98 +117,115 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 			return;
 		}
 
+		// Concurrency guard: one sync at a time.
+		if (this.isSyncInProgress) {
+			new Notice("A sync is already running.");
+			return;
+		}
+
 		// Pro gate. Lifetime free tier: 3 successful syncs total, no monthly reset.
 		// Pro users are never counted or blocked. Bail before any LLM call.
 		const isPro = verifyLicense(this.settings.proLicenseKey).valid;
 		if (!isPro && this.settings.freeUsage.count >= 3) {
-			new Notice(
-				"Free limit reached (3 syncs). Enter a Pro license in settings to continue."
-			);
+			new ProUpgradeModal(this.app).open();
 			return;
 		}
 
-		const notes = await this.collector.collect();
-
-		// Paths already cached before this run distinguish re-synthesized from new.
-		const priorPaths = new Set(Object.keys(this.cache.extractions));
-
-		let synced = 0;
-		let resynthesized = 0;
-		let skipped = 0;
-
-		for (const note of notes) {
-			// Incremental: an unchanged note (same mtime) costs no API call.
-			const existing = this.cache.extractions[note.path];
-			if (existing && existing.mtime === note.mtime) {
-				continue;
-			}
-
-			try {
-				const file = this.app.vault.getAbstractFileByPath(note.path);
-				if (!(file instanceof TFile)) {
-					skipped += 1;
-					continue;
-				}
-
-				const raw = await this.app.vault.cachedRead(file);
-				const stripped = this.stripFrontmatter(raw);
-				const body = this.cleanBody(stripped).slice(0, MAX_INPUT_CHARS);
-
-				const extraction = await this.engine.extractNote(note, body);
-				if (!extraction) {
-					skipped += 1;
-					continue;
-				}
-
-				this.cache.extractions[note.path] = {
-					mtime: note.mtime,
-					extraction,
-				};
-				synced += 1;
-				if (priorPaths.has(note.path)) {
-					resynthesized += 1;
-				}
-			} catch (error) {
-				// Network/read error on one note: warn and skip, keep the rest.
-				console.warn(
-					`[Periodic Notes Synthesizer] Sync skipped note: ${note.path}`,
-					error
-				);
-				skipped += 1;
-			}
-		}
-
-		// --- Theme synthesis: synthesize each shared-topic theme (incremental).
-		// Runs after extraction, before said-vs-did matching.
-		const synthesizedThemes = await this.synthesizeThemes(notes);
-
-		// --- Said vs did: recompute commitment completion across the FULL cached
-		// set every sync. A commitment from an earlier note can be completed by a
-		// note synced in a later run, so this runs whenever any extraction exists
-		// — even an incremental sync that synced 0 new notes. Idempotent: reset
-		// every commitment to "open", then mark the ones the model judged done.
-		const markedDone = await this.matchCommitments(notes);
-
-		// Count the use only after a fully successful sync run (one use per run,
-		// regardless of how many notes it touched). Pro users are never counted.
+		// Reserve the free-tier slot now, before any await, then refund on failure.
+		// This prevents a double-tap from consuming two slots concurrently.
+		this.isSyncInProgress = true;
 		if (!isPro) {
 			this.settings.freeUsage.count += 1;
+			await this.saveSettings();
 		}
 
-		await this.saveSettings();
+		try {
+			const notes = await this.collector.collect();
 
-		const themesClause =
-			synthesizedThemes > 0
-				? ` ${synthesizedThemes} theme${synthesizedThemes === 1 ? "" : "s"} synthesized.`
-				: "";
-		const doneClause =
-			markedDone > 0
-				? ` ${markedDone} commitment${markedDone === 1 ? "" : "s"} marked done.`
-				: "";
-		new Notice(
-			`Synced ${synced} note${synced === 1 ? "" : "s"} ` +
-				`(${resynthesized} re-synthesized, ${skipped} skipped).${themesClause}${doneClause}`
-		);
+			// Paths already cached before this run distinguish re-synthesized from new.
+			const priorPaths = new Set(Object.keys(this.cache.extractions));
+
+			let synced = 0;
+			let resynthesized = 0;
+			let skipped = 0;
+
+			for (const note of notes) {
+				// Incremental: an unchanged note (same mtime) costs no API call.
+				const existing = this.cache.extractions[note.path];
+				if (existing && existing.mtime === note.mtime) {
+					continue;
+				}
+
+				try {
+					const file = this.app.vault.getAbstractFileByPath(note.path);
+					if (!(file instanceof TFile)) {
+						skipped += 1;
+						continue;
+					}
+
+					const raw = await this.app.vault.cachedRead(file);
+					const stripped = this.stripFrontmatter(raw);
+					const body = this.cleanBody(stripped).slice(0, MAX_INPUT_CHARS);
+
+					const extraction = await this.engine.extractNote(note, body);
+					if (!extraction) {
+						skipped += 1;
+						continue;
+					}
+
+					this.cache.extractions[note.path] = {
+						mtime: note.mtime,
+						extraction,
+					};
+					synced += 1;
+					if (priorPaths.has(note.path)) {
+						resynthesized += 1;
+					}
+				} catch (error) {
+					// Network/read error on one note: warn and skip, keep the rest.
+					console.warn(
+						`[Periodic Notes Synthesizer] Sync skipped note: ${note.path}`,
+						error
+					);
+					skipped += 1;
+				}
+			}
+
+			// --- Theme synthesis: synthesize each shared-topic theme (incremental).
+			// Runs after extraction, before said-vs-did matching.
+			const synthesizedThemes = await this.synthesizeThemes(notes);
+
+			// --- Said vs did: recompute commitment completion across the FULL cached
+			// set every sync. A commitment from an earlier note can be completed by a
+			// note synced in a later run, so this runs whenever any extraction exists
+			// — even an incremental sync that synced 0 new notes. Idempotent: reset
+			// every commitment to "open", then mark the ones the model judged done.
+			const markedDone = await this.matchCommitments(notes);
+
+			await this.saveSettings();
+
+			const themesClause =
+				synthesizedThemes > 0
+					? ` ${synthesizedThemes} theme${synthesizedThemes === 1 ? "" : "s"} synthesized.`
+					: "";
+			const doneClause =
+				markedDone > 0
+					? ` ${markedDone} commitment${markedDone === 1 ? "" : "s"} marked done.`
+					: "";
+			new Notice(
+				`Synced ${synced} note${synced === 1 ? "" : "s"} ` +
+					`(${resynthesized} re-synthesized, ${skipped} skipped).${themesClause}${doneClause}`
+			);
+		} catch (error) {
+			// Refund the reserved free-tier slot so a failed sync doesn't waste a use.
+			if (!isPro) {
+				this.settings.freeUsage.count -= 1;
+				await this.saveSettings();
+			}
+			throw error;
+		} finally {
+			this.isSyncInProgress = false;
+		}
 	}
 
 	/**
@@ -719,5 +737,37 @@ export default class PeriodicNotesSynthesizerPlugin extends Plugin {
 		const month = String(now.getMonth() + 1).padStart(2, "0");
 		const day = String(now.getDate()).padStart(2, "0");
 		return `${year}-${month}-${day}`;
+	}
+}
+
+class ProUpgradeModal extends Modal {
+	override onOpen(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+
+		contentEl.createEl("h2", { text: "Free limit reached" });
+
+		contentEl.createEl("p", {
+			text: "You've used all 3 free syncs. You can still generate reports from already-synced content at any time — new syncs require a Pro license.",
+		});
+
+		const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
+
+		const getProBtn = buttonRow.createEl("button", {
+			text: "Get Pro license",
+			cls: "mod-cta",
+		});
+		getProBtn.addEventListener("click", () => {
+			window.open(GUMROAD_URL, "_blank");
+		});
+
+		const gotItBtn = buttonRow.createEl("button", { text: "Got it" });
+		gotItBtn.addEventListener("click", () => {
+			this.close();
+		});
+	}
+
+	override onClose(): void {
+		this.contentEl.empty();
 	}
 }

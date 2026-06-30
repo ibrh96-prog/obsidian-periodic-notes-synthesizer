@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type PeriodicNotesSynthesizerPlugin from "./main";
-import { verifyLicense } from "./license";
+import { verifyLicense, GUMROAD_URL } from "./license";
 
 export type LLMProvider = "anthropic" | "openai-compatible";
 
@@ -173,8 +173,19 @@ export class PeriodicNotesSettingTab extends PluginSettingTab {
 				);
 		} else {
 			new Setting(containerEl).setDesc(
-				`Free tier: ${this.plugin.settings.freeUsage.count} of 3 syncs used.`
+				`Free tier — 3 total syncs (lifetime). (${this.plugin.settings.freeUsage.count}/3 used)`
 			);
+
+			new Setting(containerEl).setName("Upgrade to Pro").setHeading();
+
+			new Setting(containerEl)
+				.setName("Unlimited syncs")
+				.setDesc("One-time payment, no subscription. License works offline.")
+				.addButton((btn) => {
+					btn.setButtonText("Get Pro license").setCta().onClick(() => {
+						window.open(GUMROAD_URL, "_blank");
+					});
+				});
 		}
 	}
 }
