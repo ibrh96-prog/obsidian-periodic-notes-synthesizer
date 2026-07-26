@@ -9,7 +9,7 @@ This End User License Agreement ("Agreement") is a legal agreement between you (
 
 The free tier of the Software is provided at no cost, subject to the usage limits described in the Software and its documentation.
 
-Upon purchase of a Pro license, you are granted a personal, non-exclusive, non-transferable license to use the Pro features of the Software for your own personal or internal business use. A Pro license is a one-time purchase priced at USD $19.99.
+Upon purchase of a Pro license, you are granted a personal, non-exclusive, non-transferable license to use the Pro features of the Software for your own personal or internal business use. A Pro license is a one-time purchase. See the official Gumroad product page for current pricing.
 
 ## 2. License key
 

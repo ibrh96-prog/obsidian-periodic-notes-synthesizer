@@ -52,6 +52,8 @@ This is operational synthesis of your daily-note practice — it works alongside
 
 The free tier allows 3 total syncs (a one-time allowance, not a monthly reset). Generating the periodic report from already-synced notes is always free. Upgrade to Pro at [ibrh96.gumroad.com/l/orevhj](https://ibrh96.gumroad.com/l/orevhj) for unlimited syncing.
 
+The free allowance is stored in this vault's local plugin data. Each vault has its own allowance. Removing the plugin's local data may reset the recorded usage. There is no account and no server-side record of your usage.
+
 ## Privacy
 
 - No servers, no accounts, no databases, no telemetry, and no backend data collection on our side
@@ -65,4 +67,6 @@ For bugs and feature requests, open an issue on the [GitHub repository](https://
 
 ## License
 
-See [EULA.md](EULA.md) for terms of use.
+The source code in this repository is licensed under the **MIT License** — see [LICENSE](LICENSE).
+
+[EULA.md](EULA.md) governs the official Pro purchase: activation, license keys, refunds, warranty, and support. It does not restrict the MIT-licensed source code.
